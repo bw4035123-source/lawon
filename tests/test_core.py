@@ -1,0 +1,383 @@
+"""Python 서버 단위·통합 테스트: 데이터 무결성, 가드, DRF 파서, LLM 어댑터(HTTP 모킹), HTTP 서버"""
+import io
+import json
+import os
+import sys
+import threading
+import unittest
+import urllib.error
+import urllib.request
+from pathlib import Path
+from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+for k in ("LAW_API_OC", "LAW_OC", "LLM_PROVIDER", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
+    os.environ.pop(k, None)
+os.environ["LAW_PROXY_URL"] = "off"  # 테스트는 네트워크 없이(기본 중계 서버 대신 직접 모드 + 모킹)
+
+from law_for_all import data  # noqa: E402
+from law_for_all.analyze import analyze  # noqa: E402
+from law_for_all.ask import ask  # noqa: E402
+from law_for_all.drf import parse_articles, parse_case_list, parse_law_list  # noqa: E402
+from law_for_all.guard import GuardError, find_unverified_mentions, guard_llm_output, sanitize_markers  # noqa: E402
+from law_for_all.server import make_server  # noqa: E402
+
+
+class FakeResp(io.BytesIO):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def fake_urlopen(payload: dict, calls: list):
+    def _open(req, timeout=None):
+        calls.append(req)
+        return FakeResp(json.dumps(payload).encode("utf-8"))
+    return _open
+
+
+class DataIntegrity(unittest.TestCase):
+    def test_refs_exist(self):
+        for t in data.TOPICS:
+            for r in t["refs"]:
+                self.assertTrue(data.article_exists(r), f"{t['id']} {r}")
+        for pid, p in data.PERSPECTIVES.items():
+            for r in p["judge"]["requirements"]:
+                if r.get("ref"):
+                    self.assertTrue(data.article_exists(r["ref"]), f"{pid} {r['ref']}")
+
+
+_LAW = data.get_law("housing-lease")
+_CTX = [data.to_citation(_LAW, a) for a in _LAW["articles"] if a["no"] in ("3", "3의2")]
+
+
+class GuardTest(unittest.TestCase):
+    ctx = _CTX
+
+    def test_sanitize(self):
+        out, removed, used = sanitize_markers("가 [[housing-lease:3]]. 나 [[fake:1]].", {c["key"] for c in self.ctx})
+        self.assertEqual(removed, ["fake:1"])
+        self.assertEqual(used, ["housing-lease:3"])
+        self.assertNotIn("fake", out)
+
+    def test_unverified(self):
+        bad = find_unverified_mentions("「주택임대차보호법」 제3조, 「주택임대차보호법」 제99조, 「민사집행법」 제41조", self.ctx)
+        self.assertEqual(bad, ["「주택임대차보호법」 제99조"])
+
+    def test_no_citation_raises(self):
+        with self.assertRaises(GuardError):
+            guard_llm_output({"summary": "근거 없음", "citations": []}, "officer", self.ctx)
+
+
+class DrfTest(unittest.TestCase):
+    def test_parse(self):
+        self.assertEqual(parse_law_list({"LawSearch": {"law": {"법령명한글": "형법", "법령일련번호": "1"}}})[0]["mst"], "1")
+        arts = parse_articles({"조문단위": [{"조문여부": "전문"}, {"조문여부": "조문", "조문번호": "3", "조문가지번호": "2", "조문제목": "t", "조문내용": "제3조의2(t) ① 본문", "항": {"항내용": "② 둘째", "호": [{"호내용": "1. 호"}]}}]})
+        self.assertEqual(arts, [{"no": "3의2", "title": "t", "text": "① 본문\n② 둘째\n  1. 호"}])
+        self.assertNotIn("OC=", parse_case_list({"prec": [{"사건명": "x", "사건번호": "2020다1"}]}, "판례")[0]["url"])
+
+
+class LLMAdapterTest(unittest.TestCase):
+    def tearDown(self):
+        for k in ("LLM_PROVIDER", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
+            os.environ.pop(k, None)
+
+    def test_openai_guard(self):
+        os.environ.update(OPENAI_API_KEY="sk-test", LLM_PROVIDER="openai")
+        content = json.dumps({"summary": "0.03% 이상 [[road-traffic:44]]. 가짜 [[road-traffic:999]]", "steps": [{"title": "a", "detail": "b", "ref": "road-traffic:44"}], "citations": ["road-traffic:44"]})
+        calls = []
+        with mock.patch("urllib.request.urlopen", fake_urlopen({"model": "gpt-test", "choices": [{"message": {"content": content}}]}, calls)):
+            r = ask("음주운전 처벌 기준", "citizen")
+        self.assertEqual(calls[0].full_url, "https://api.openai.com/v1/chat/completions")
+        self.assertEqual(json.loads(calls[0].data)["response_format"], {"type": "json_object"})
+        self.assertEqual(r["provider"]["id"], "openai")
+        self.assertIn("road-traffic:999", r["guard"]["removedCitations"])
+
+    def test_anthropic_bad_json_falls_back(self):
+        os.environ.update(ANTHROPIC_API_KEY="k")
+        calls = []
+        with mock.patch("urllib.request.urlopen", fake_urlopen({"model": "c", "content": [{"type": "text", "text": "JSON 아님"}]}, calls)):
+            r = ask("민원 처리 기한", "officer", "anthropic")
+        self.assertEqual(calls[0].full_url, "https://api.anthropic.com/v1/messages")
+        self.assertEqual(calls[0].get_header("X-api-key"), "k")
+        self.assertEqual(r["provider"]["id"], "mock")
+        self.assertIn("Anthropic", r["guard"]["fallbackReason"])
+
+    def test_ollama_analysis(self):
+        os.environ.update(LLM_PROVIDER="ollama")
+        content = json.dumps({
+            "lawyer": {"stance": "주장 [[labor-standards:36]]", "arguments": ["14일 [[labor-standards:36]]"]},
+            "prosecutor": {"stance": "처벌 [[labor-standards:109]]"},
+            "judge": {"stance": "판단", "requirements": [{"label": "퇴직", "ref": "labor-standards:36", "status": "met", "basis": "퇴사"}, {"label": "x", "ref": "fake:1", "status": "??"}]},
+            "citations": ["labor-standards:36"],
+        })
+        calls = []
+        with mock.patch("urllib.request.urlopen", fake_urlopen({"model": "exaone3.5:7.8b", "message": {"content": content}}, calls)):
+            r = analyze("퇴사했는데 사장님이 마지막 월급을 3주째 안 주고 있어요")
+        self.assertEqual(calls[0].full_url, "http://localhost:11434/api/chat")
+        self.assertEqual(r["provider"]["id"], "ollama")
+        req = r["analyses"][0]["perspectives"]["judge"]["requirements"]
+        self.assertEqual(req[1]["status"], "unclear")
+        self.assertNotIn("ref", req[1])
+        self.assertIn("fake:1", r["guard"]["removedCitations"])
+
+    def test_http_error_falls_back(self):
+        os.environ.update(OPENAI_API_KEY="bad", LLM_PROVIDER="openai")
+
+        def boom(req, timeout=None):
+            raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {}, io.BytesIO(b'{"error":{"message":"invalid key"}}'))
+
+        with mock.patch("urllib.request.urlopen", boom):
+            r = ask("층간소음 기준", "citizen")
+        self.assertEqual(r["provider"]["id"], "mock")
+        self.assertIn("invalid key", r["guard"]["fallbackReason"])
+
+
+class ServerTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.httpd = make_server("127.0.0.1", 0)
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+        threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def req(self, path, body=None):
+        r = urllib.request.Request(self.base + path, data=json.dumps(body).encode() if body is not None else None, headers={"content-type": "application/json"})
+        try:
+            with urllib.request.urlopen(r, timeout=10) as res:
+                return res.status, json.loads(res.read()), res.headers
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read()), e.headers
+
+    def test_api(self):
+        s, j, h = self.req("/api/health")
+        self.assertEqual((s, j["runtime"]), (200, "python"))
+        self.assertEqual(h["X-Content-Type-Options"], "nosniff")
+        s, j, _ = self.req("/api/ask", {"query": "윗집 층간소음 기준", "mode": "citizen"})
+        self.assertEqual(j["topic"]["id"], "floor-noise")
+        s, j, _ = self.req("/api/ask", {"query": "x"})
+        self.assertEqual((s, j["error"]), (400, "질문을 2자 이상 입력해 주세요."))
+        s, j, _ = self.req("/api/analyze", {"situation": "짧음"})
+        self.assertEqual(s, 400)
+        s, j, _ = self.req("/api/laws/housing-lease")
+        self.assertEqual(j["children"][0]["id"], "housing-lease-decree")
+        s, j, _ = self.req("/api/laws/NOPE!")
+        self.assertEqual(s, 400)
+        s, j, _ = self.req("/api/providers")
+        self.assertEqual([p["id"] for p in j["providers"]], ["mock", "openai", "anthropic", "ollama"])
+
+    def test_keepalive_after_early_error(self):
+        """오류로 일찍 응답해도 본문을 읽어 같은 연결의 다음 요청이 정상 처리되어야 함"""
+        import http.client
+        conn = http.client.HTTPConnection("127.0.0.1", self.httpd.server_address[1], timeout=5)
+        body = json.dumps({"query": "x" * 600}).encode()
+        conn.request("POST", "/api/ask", body, {"content-type": "application/json"})
+        r1 = conn.getresponse()
+        r1.read()
+        self.assertEqual(r1.status, 400)
+        conn.request("GET", "/api/health")
+        r2 = conn.getresponse()
+        self.assertEqual(r2.status, 200)
+        self.assertEqual(json.loads(r2.read())["status"], "ok")
+        conn.close()
+
+    def test_static_traversal_blocked(self):
+        try:
+            with urllib.request.urlopen(self.base + "/..%2f..%2frun.py", timeout=5) as r:
+                status = r.status
+                body = r.read()
+        except urllib.error.HTTPError as e:
+            status, body = e.code, b""
+        self.assertTrue(status == 404 or b"argparse" not in body)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class LiveModeTest(unittest.TestCase):
+    def test_case_search_fallback(self):
+        from law_for_all import service
+        calls = []
+
+        def fake(path, params, oc, timeout=20, retries=None):
+            calls.append(params)
+            if params["target"] == "prec":
+                return {"PrecSearch": {"prec": [{"사건명": "본문일치", "사건번호": "2025다1"}] if params.get("search") == "2" else []}}
+            return {"Expc": {"expc": [{"안건명": "a", "안건번호": "1"}, {"안건명": "b", "안건번호": "2"}]}}
+
+        with mock.patch.object(service, "drf_get", fake):
+            cases = service.LawService("k").search_cases("층간소음")
+        self.assertEqual([c["caseNo"] for c in cases if c["kind"] == "판례"], ["2025다1"])
+        self.assertFalse(any(p["target"] == "expc" and p.get("search") == "2" for p in calls))
+
+    def test_effective_date_from_list(self):
+        from law_for_all import service
+
+        def fake(path, params, oc, timeout=20, retries=None):
+            if path == "lawSearch.do":
+                return {"LawSearch": {"law": [{"법령명한글": "행정심판법", "법령일련번호": "7", "시행일자": "20230321", "현행연혁코드": "현행"}]}}
+            return {"법령": {"기본정보": {"법령명_한글": "행정심판법", "시행일자": "20280101"}, "조문": {"조문단위": [{"조문여부": "조문", "조문번호": "27", "조문제목": "t", "조문내용": "제27조(t) ① 90일"}]}}}
+
+        with mock.patch.object(service, "drf_get", fake):
+            law = service.LawService("k").get_law("admin-appeal")
+        self.assertEqual((law["source"], law["effectiveDate"]), ("live", "20230321"))
+
+    def test_retry_on_reset(self):
+        from law_for_all import drf
+        drf._cache.clear()
+        n = {"i": 0}
+
+        def flaky(req, timeout=None):
+            n["i"] += 1
+            if n["i"] < 3:
+                raise ConnectionResetError(104, "reset")
+            return FakeResp(b'{"ok": 1}')
+
+        with mock.patch("urllib.request.urlopen", flaky), mock.patch("time.sleep"):
+            self.assertEqual(drf.drf_get("lawSearch.do", {"q": "x"}, "k"), {"ok": 1})
+        self.assertEqual(n["i"], 3)
+
+
+class ProxyRouteTest(unittest.TestCase):
+    def test_default_and_routing(self):
+        from law_for_all import config as cfg, drf
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("LAW_PROXY_URL", None)
+            self.assertIsNone(cfg.law_proxy())  # 기본: 법제처 API 직접 호출
+        seen = []
+
+        class R(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake(req, timeout=None):
+            seen.append((req.full_url, req.headers.get("X-proxy-token")))
+            return R(b'{"LawSearch": {"law": []}}')
+
+        with mock.patch.dict(os.environ, {"LAW_PROXY_URL": "https://p.example/", "LAW_PROXY_TOKEN": "tok"}), mock.patch("urllib.request.urlopen", fake):
+            drf.drf_get("lawSearch.do", {"target": "law", "query": "proxy-test"}, "SECRET", 1, 0)
+        self.assertTrue(seen[0][0].startswith("https://p.example/api/raw/lawSearch.do?target=law"))
+        self.assertNotIn("SECRET", seen[0][0])
+        self.assertEqual(seen[0][1], "tok")
+
+
+class CaseViewerTest(unittest.TestCase):
+    def test_parse_detail(self):
+        from law_for_all.drf import parse_case_detail, parse_case_list
+        d = parse_case_detail({"PrecService": {"사건명": "부당해고", "사건번호": "2023두1", "법원명": "대법원", "판결요지": "[1] 실질<br/>[2] 종속", "판례내용": "<b>○○</b>&nbsp;조합"}}, "판례", "1")
+        self.assertEqual([s["label"] for s in d["sections"]], ["판결요지", "판결 전문"])
+        self.assertEqual(d["sections"][0]["text"], "[1] 실질\n[2] 종속")
+        self.assertEqual(d["sections"][1]["text"], "○○ 조합")
+        self.assertEqual(parse_case_list({"prec": [{"사건명": "x", "판례일련번호": "77"}]}, "판례")[0]["id"], "77")
+
+    def test_detail_route_without_key(self):
+        httpd = make_server("127.0.0.1", 0)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        try:
+            for path, code in (("/api/cases/detail?kind=prec&id=abc", 400), ("/api/cases/detail?kind=prec&id=123", 503)):
+                try:
+                    urllib.request.urlopen(base + path, timeout=5)
+                    status = 200
+                except urllib.error.HTTPError as e:
+                    status = e.code
+                self.assertEqual(status, code, path)
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+
+class LiveBudgetTest(unittest.TestCase):
+    def test_slow_api_falls_back_within_budget(self):
+        """국가법령정보센터가 응답하지 않아도 답변은 시간 예산 안에 공식 원문 스냅샷으로 나와야 함"""
+        import time as _t
+        from law_for_all import service
+
+        def hang(*a, **k):
+            _t.sleep(3)
+            raise service.LawApiError("timeout")
+
+        with mock.patch.object(service, "drf_get", hang):
+            svc = service.LawService("k")
+            t0 = _t.time()
+            cites = svc.get_citations(["apartment-mgmt:20", "floor-noise-rule:3"], budget=0.5)
+            took = _t.time() - t0
+        self.assertLess(took, 1.5)
+        self.assertEqual([c["key"] for c in cites], ["apartment-mgmt:20", "floor-noise-rule:3"])
+        self.assertTrue(all(c["source"] == "mock" for c in cites))
+        self.assertTrue(any("응답 지연" in w for w in svc.warnings))
+
+
+class CaseBudgetTest(unittest.TestCase):
+    def test_slow_fulltext_is_skipped_within_budget(self):
+        """사건명 검색 결과가 없고 본문 검색이 느려도 예산 안에 응답(본문 검색 생략 안내)"""
+        import time as _t
+        from law_for_all import service
+
+        def fake(path, params, oc, timeout=20, retries=None):
+            if params.get("search") == "2":
+                _t.sleep(3)
+            return {"PrecSearch": {"prec": []}} if params["target"] == "prec" else {"Expc": {"expc": []}}
+
+        with mock.patch.object(service, "drf_get", fake):
+            svc = service.LawService("k")
+            t0 = _t.time()
+            svc.search_cases("층간소음", budget=1.0)
+            took = _t.time() - t0
+        self.assertLess(took, 2.0)
+        self.assertTrue(any("본문 검색이 지연" in w for w in svc.warnings))
+
+
+class LiveSearchTest(unittest.TestCase):
+    """토픽 밖 질문 → 법제처 Open API 전체 법령 검색 순위(실제 응답 고정 데이터로 재현, Next.js 판과 같은 결과)"""
+
+    def test_ranking(self):
+        import urllib.parse
+        from law_for_all import service
+        fx = json.loads((Path(__file__).resolve().parents[2] / "tests/fixtures/live-search.json").read_text(encoding="utf-8"))
+
+        def fake(path, params, oc, timeout=20, retries=None):
+            k = path + "?" + urllib.parse.urlencode(sorted(params.items()))
+            if k not in fx:
+                raise service.LawApiError("no fixture " + k)
+            return fx[k]
+
+        cases = [("반려견 목줄 안하면 과태료 있나요", "동물보호법", "16"), ("청소년에게 술 팔면 처벌받나요", "청소년 보호법", "28"),
+                 ("건축허가 받으려면 뭐가 필요해요", "건축법", "11"), ("학교폭력 신고하면 어떻게 처리되나요", "학교폭력예방 및 대책에 관한 법률", "20"),
+                 ("주차장 설치 기준은 어떻게 되나요?", "주차장법", "12")]
+        with mock.patch.object(service, "drf_get", fake):
+            for q, law, no in cases:
+                svc = service.LawService("test")
+                keys = svc.search_live_keys(q, budget=60)
+                cites = svc.get_citations(keys, 0)
+                self.assertIn(f"{law}:{no}", [f"{c['lawName']}:{c['articleNo']}" for c in cites], q)
+
+
+class RuleParserTest(unittest.TestCase):
+    """행정규칙·자치법규 파서 — Next.js 판(tests/rules.test.ts)과 같은 실제 응답·같은 결과"""
+
+    def test_parsers(self):
+        from law_for_all.drf import parse_admrul_doc, parse_ordin_doc
+        from law_for_all.data import article_label
+        fx = json.loads((Path(__file__).resolve().parents[2] / "tests/fixtures/rules.json").read_text(encoding="utf-8"))
+        o = parse_ordin_doc(fx["ordin"], "ord-2118167")
+        self.assertEqual([o["name"], o["kind"], o["ministry"]], ["강화군 공동주택 층간소음 방지 조례", "자치법규", "인천광역시 강화군 · 조례"])
+        self.assertEqual([(a["no"], a["title"]) for a in o["articles"]], [("1", "목적"), ("2", "정의"), ("3", "군수의 책무")])
+        self.assertRegex(o["articles"][1]["text"].split("\n")[1], r"^ {2}1\. “공동주택”이란")
+        a = parse_admrul_doc(fx["admrul"], "adm-2100000265232")
+        self.assertEqual([a["name"], a["ministry"], a["articles"][0]["no"], article_label("본문")], ["층간소음 전문기관 지정 고시", "기후에너지환경부 · 고시", "본문", "본문"])
+        self.assertNotIn("<img", a["articles"][0]["text"])
+        self.assertRegex(a["articles"][0]["text"].split("\n")[1], r"^2\. 재검토기한")
+        b = parse_admrul_doc(fx["admrulArticles"], "adm-99")
+        self.assertEqual([x["no"] for x in b["articles"]], ["1", "2", "2의2"])
+        self.assertEqual(b["articles"][1]["text"], "① 이 지침은 공무원에게 적용한다.\n② 다만, 다음 각 호는 제외한다.\n  1. 계약직2. 위촉직")
