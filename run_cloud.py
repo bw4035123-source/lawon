@@ -6,6 +6,16 @@
 """
 import os
 import sys
+import urllib.request
+
+# Render 서버의 공인 IP를 확인하여 로그에 출력
+try:
+    current_ip = urllib.request.urlopen("https://api.ipify.org", timeout=5).read().decode("utf-8")
+    print("=" * 50)
+    print(f"[MY_RENDER_SERVER_IP] >>> {current_ip} <<<")
+    print("=" * 50)
+except Exception as e:
+    print(f"IP 확인 실패: {e}")
 
 port = os.environ.get("PORT", "8000")
 try:
