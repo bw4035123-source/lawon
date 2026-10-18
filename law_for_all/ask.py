@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 from .config import config
 from .data import LAWS, article_key, get_law, parse_key
-from .guard import find_unverified_mentions, guard_llm_output, parse_loose_json, sanitize_markers
+from .guard import extract_markers, find_unverified_mentions, guard_llm_output, parse_loose_json, sanitize_markers
 from .llm import resolve_provider
 from .prompts import system_prompt, user_prompt
 from .rule_engine import build_rule_answer
@@ -109,6 +109,8 @@ def ask(query: str, mode: str = "citizen", provider: str | None = None) -> dict:
     if removed:
         notices.append(f"근거 목록에 없는 인용 {len(removed)}건을 자동 제거했습니다.")
 
+    # 법도우미 답변에 처음 나오는 순서대로 근거 번호가 1부터 매겨지도록 정렬
+    citation_keys = list(dict.fromkeys([k for k in extract_markers(out["summary"]) if k in citation_keys] + citation_keys))
     by_key = {c["key"]: c for c in context}
     citations = [by_key[k] for k in citation_keys if k in by_key]
     notices += svc.warnings
