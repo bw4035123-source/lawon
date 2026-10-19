@@ -70,6 +70,17 @@ class GuardTest(unittest.TestCase):
         with self.assertRaises(GuardError):
             guard_llm_output({"summary": "근거 없음", "citations": []}, "officer", self.ctx)
 
+    def test_small_model_output(self):
+        # 감싼 JSON·answer 키·[[키]] 누락 보정 — 근거 목록의 조문을 이름·번호로 언급할 때만 인용으로 인정
+        g = guard_llm_output({"answer": {"answer": "「주택임대차보호법」 제3조에 따라 전입 다음 날 대항력이 생겨요."}}, "citizen", self.ctx)
+        self.assertEqual(g["citationKeys"], ["housing-lease:3"])
+        with self.assertRaises(GuardError):
+            guard_llm_output({"summary": "「주택임대차보호법」 제30조를 보세요."}, "citizen", self.ctx)
+        self.assertEqual(guard_llm_output({"summary": "주택임대차보호법 제3조의2에 따라 우선변제"}, "officer", self.ctx)["citationKeys"], ["housing-lease:3의2"])
+        from law_for_all.guard import guard_analysis_output
+        a = guard_analysis_output({"result": {"lawyer": {"stance": "「주택임대차보호법」 제3조 대항력 주장"}, "prosecutor": {"stance": ""}, "judge": {"stance": "요건 검토"}}}, self.ctx)
+        self.assertEqual(a["citationKeys"], ["housing-lease:3"])
+
 
 class DrfTest(unittest.TestCase):
     def test_parse(self):
@@ -122,6 +133,37 @@ class LLMAdapterTest(unittest.TestCase):
         self.assertEqual(req[1]["status"], "unclear")
         self.assertNotIn("ref", req[1])
         self.assertIn("fake:1", r["guard"]["removedCitations"])
+
+    def test_llm_test_two_models(self):
+        """--llm-test: 모델을 바꿔 가며 같은 질문을 돌리고, 2종 모두 통과하면 입증으로 판정·결과 문서 작성"""
+        import re
+        import tempfile
+        from law_for_all.llmtest import run as llm_test
+        sent_models = []
+
+        def fake_ollama(req, timeout=None):
+            body = json.loads(req.data)
+            sent_models.append(body["model"])
+            # 질문 프롬프트에 실린 근거 조문 키(<<법령id:조>>)만 인용 — 지시문 속 예시 표기는 제외
+            keys = re.findall(r"<<([^>\s]+)>>", body["messages"][-1]["content"]) or ["labor-standards:36"]
+            k = keys[0]
+            content = json.dumps({
+                "summary": f"근거 조문에 따르면 이렇습니다 [[{k}]].", "steps": [{"title": "확인", "detail": "원문 확인", "ref": k}],
+                "background": f"배경 [[{k}]]", "keyPoints": [f"쟁점 [[{k}]]"], "adminNotes": ["유의"], "checklist": ["확인"],
+                "lawyer": {"stance": f"주장 [[{k}]]"}, "prosecutor": {"stance": f"검토 [[{k}]]"},
+                "judge": {"stance": "판단", "requirements": [{"label": "요건", "ref": k, "status": "met", "basis": "서술"}], "outlook": "가능성"},
+                "citations": [k],
+            }, ensure_ascii=False)
+            return FakeResp(json.dumps({"model": body["model"], "message": {"content": content}}).encode("utf-8"))
+
+        with tempfile.TemporaryDirectory() as d, mock.patch("urllib.request.urlopen", fake_ollama):
+            path, two = llm_test("ollama:gemma3:4b,ollama:exaone3.5:7.8b", Path(d))
+            text = path.read_text(encoding="utf-8")
+        self.assertTrue(two)
+        self.assertEqual(set(sent_models), {"gemma3:4b", "exaone3.5:7.8b"})
+        self.assertIn("| ollama:gemma3:4b | gemma3:4b | 4/4 |", text)
+        self.assertIn("| ollama:exaone3.5:7.8b | exaone3.5:7.8b | 4/4 |", text)
+        self.assertNotIn("OLLAMA_MODEL", os.environ)  # 모델 바꾼 설정은 끝나면 원래대로
 
     def test_http_error_falls_back(self):
         os.environ.update(OPENAI_API_KEY="bad", LLM_PROVIDER="openai")
@@ -186,6 +228,16 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(h["Access-Control-Allow-Origin"], "*")
         with urllib.request.urlopen(self.base + "/", timeout=5) as res:
             self.assertIsNone(res.headers.get("Access-Control-Allow-Origin"))
+
+    def test_share_download(self):
+        """사이트에서 공유판을 내려받을 때: 열지 않고 저장(attachment), 영문 파일 이름"""
+        from law_for_all.server import WEB
+        if not (WEB / "downloads" / "law-on-share.html").is_file():
+            self.skipTest("빌드 전에는 공유판 파일이 없음")
+        req = urllib.request.Request(self.base + "/downloads/law-on-share.html", method="HEAD")
+        with urllib.request.urlopen(req, timeout=10) as res:
+            cd = res.headers["Content-Disposition"]
+        self.assertEqual(cd, 'attachment; filename="LAW-ON_share.html"')
 
     def test_keepalive_after_early_error(self):
         """오류로 일찍 응답해도 본문을 읽어 같은 연결의 다음 요청이 정상 처리되어야 함"""
@@ -265,7 +317,9 @@ class ProxyRouteTest(unittest.TestCase):
         from law_for_all import config as cfg, drf
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("LAW_PROXY_URL", None)
-            self.assertIsNone(cfg.law_proxy())  # 기본: 법제처 API 직접 호출
+            self.assertEqual(cfg.law_proxy()["url"], "https://lawon.onrender.com")  # 기본: 법이음 클라우드 서버 중계
+        with mock.patch.dict(os.environ, {"LAW_PROXY_URL": "off"}):
+            self.assertIsNone(cfg.law_proxy())  # off: 법제처 API 직접 호출
         seen = []
 
         class R(io.BytesIO):
@@ -284,6 +338,44 @@ class ProxyRouteTest(unittest.TestCase):
         self.assertTrue(seen[0][0].startswith("https://p.example/api/raw/lawSearch.do?target=law"))
         self.assertNotIn("SECRET", seen[0][0])
         self.assertEqual(seen[0][1], "tok")
+
+
+class RelayTest(unittest.TestCase):
+    def test_relay_endpoint(self):
+        """중계(/api/raw): 허용 범위만, 인증키를 붙여 조회하고 응답 속 인증키는 지운다"""
+        from law_for_all import drf
+        from law_for_all.server import make_server
+        seen = []
+
+        class R(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake(req, timeout=None):
+            seen.append(req.full_url)
+            return R('{"PrecSearch": {"prec": [{"판례상세링크": "/DRF/lawService.do?OC=SECRETOC&target=prec&ID=1"}]}}'.encode())
+
+        httpd = make_server("127.0.0.1", 0)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        real_open = urllib.request.urlopen
+        try:
+            with mock.patch.dict(os.environ, {"LAW_API_OC": "SECRETOC"}), mock.patch.object(drf.urllib.request, "urlopen", fake):
+                body = real_open(base + "/api/raw/lawSearch.do?target=prec&query=relay-test").read().decode()
+            self.assertIn("OC=SECRETOC", seen[0])
+            self.assertNotIn("SECRETOC", body)
+            self.assertIn("PrecSearch", body)
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                real_open(base + "/api/raw/lawSearch.do?target=evil")
+            self.assertEqual(cm.exception.code, 400)
+            with mock.patch.dict(os.environ, {"LAW_API_OC": ""}), self.assertRaises(urllib.error.HTTPError) as cm:
+                real_open(base + "/api/raw/lawSearch.do?target=law&query=x")
+            self.assertEqual(cm.exception.code, 503)
+        finally:
+            httpd.shutdown()
 
 
 class CaseViewerTest(unittest.TestCase):

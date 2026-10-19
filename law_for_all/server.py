@@ -16,6 +16,7 @@ from . import __version__
 from .analyze import analyze
 from .ask import ask
 from .config import config
+from .drf import RELAY_PATHS, RELAY_TARGETS, LawApiError, relay_raw
 from .llm import list_providers
 from .service import LawService
 
@@ -27,6 +28,8 @@ SECURITY_HEADERS = {
     "X-Frame-Options": "SAMEORIGIN",
     "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
 }
+# 내려받기 파일의 저장 이름 — 한글 이름은 일부 브라우저가 "download" 로 바꿔 저장하므로 영문으로
+DOWNLOAD_NAMES = {"law-on-share.html": "LAW-ON_share.html"}
 # /api/* 는 단일 파일 공유판(다른 출처·파일로 연 HTML)에서도 부를 수 있게 허용 — 인증키는 서버에만 있고 응답에 담기지 않는다
 CORS_HEADERS = {
     "Access-Control-Allow-Origin": "*",
@@ -212,6 +215,20 @@ class Handler(BaseHTTPRequestHandler):
             if not detail:
                 raise ApiError(404, svc.warnings[0] if svc.warnings else "판례를 찾을 수 없습니다.")
             return self._json(200, {"detail": detail})
+        m = re.fullmatch(r"/api/raw/([A-Za-z]+\.do)", path)
+        if method in ("GET", "HEAD") and m:  # 법령 API 중계: 인증키·등록 IP가 있는 이 서버가 대신 조회(실행판·다른 PC용)
+            ok, retry = rate_limit(f"raw:{self._client()}", 120)
+            if not ok:
+                raise ApiError(429, "요청이 너무 많습니다. 잠시 후 다시 시도해 주세요.", {"Retry-After": str(retry)})
+            params = {k: v[0][:200] for k, v in qs.items() if v}
+            if m.group(1) not in RELAY_PATHS or params.get("target") not in RELAY_TARGETS:
+                return self._json(400, {"ok": False, "error": "허용되지 않은 요청입니다."})
+            if not config.law_api_oc:
+                return self._json(503, {"ok": False, "error": "중계 서버에 인증키(LAW_API_OC)가 설정되어 있지 않습니다."})
+            try:
+                return self._send(200, relay_raw(m.group(1), params, config.law_api_oc), "application/json; charset=utf-8", None, method == "HEAD")
+            except LawApiError as e:
+                return self._json(502, {"ok": False, "error": str(e)})
         if method == "POST" and path in ("/api/ask", "/api/analyze"):
             ok, retry = rate_limit(f"{path}:{self._client()}", 30 if path == "/api/ask" else 20)
             if not ok:
@@ -239,7 +256,10 @@ class Handler(BaseHTTPRequestHandler):
                 if ctype.startswith("text/") or ctype.endswith(("javascript", "json", "svg+xml")):
                     ctype += "; charset=utf-8"
                 cache = "public, max-age=31536000, immutable" if rel.startswith("_next/static/") else "no-cache"
-                return self._send(200, f.read_bytes(), ctype, {"Cache-Control": cache}, head_only)
+                extra = {"Cache-Control": cache}
+                if rel.startswith("downloads/"):  # 내려받기 파일은 열지 않고 저장
+                    extra["Content-Disposition"] = f'attachment; filename="{DOWNLOAD_NAMES.get(f.name, f.name)}"'
+                return self._send(200, f.read_bytes(), ctype, extra, head_only)
         nf = WEB / "404.html"
         return self._send(404, nf.read_bytes() if nf.is_file() else b"Not Found", "text/html; charset=utf-8", None, head_only)
 
