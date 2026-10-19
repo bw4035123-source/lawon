@@ -172,6 +172,21 @@ class ServerTest(unittest.TestCase):
         s, j, _ = self.req("/api/providers")
         self.assertEqual([p["id"] for p in j["providers"]], ["mock", "openai", "anthropic", "ollama"])
 
+    def test_cors_for_shared_page(self):
+        """단일 파일 공유판(다른 출처)이 /api/* 를 부를 수 있어야 하고, 화면 파일에는 허용 헤더를 붙이지 않음"""
+        import http.client
+        conn = http.client.HTTPConnection("127.0.0.1", self.httpd.server_address[1], timeout=5)
+        conn.request("OPTIONS", "/api/ask", headers={"Origin": "null", "Access-Control-Request-Method": "POST"})
+        r = conn.getresponse()
+        r.read()
+        self.assertEqual((r.status, r.getheader("Access-Control-Allow-Origin")), (204, "*"))
+        self.assertIn("POST", r.getheader("Access-Control-Allow-Methods"))
+        conn.close()
+        _, _, h = self.req("/api/health")
+        self.assertEqual(h["Access-Control-Allow-Origin"], "*")
+        with urllib.request.urlopen(self.base + "/", timeout=5) as res:
+            self.assertIsNone(res.headers.get("Access-Control-Allow-Origin"))
+
     def test_keepalive_after_early_error(self):
         """오류로 일찍 응답해도 본문을 읽어 같은 연결의 다음 요청이 정상 처리되어야 함"""
         import http.client
@@ -381,3 +396,30 @@ class RuleParserTest(unittest.TestCase):
         b = parse_admrul_doc(fx["admrulArticles"], "adm-99")
         self.assertEqual([x["no"] for x in b["articles"]], ["1", "2", "2의2"])
         self.assertEqual(b["articles"][1]["text"], "① 이 지침은 공무원에게 적용한다.\n② 다만, 다음 각 호는 제외한다.\n  1. 계약직2. 위촉직")
+
+
+class GovThemePatchTest(unittest.TestCase):
+    """2026 챌린지 테마 적용기: </head>·</body> 바로 앞 삽입, 중복 없음, 되돌리면 원본과 동일"""
+
+    def test_patch_idempotent_and_revert(self):
+        import tempfile
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        import patch_gov_theme as g
+        html = '<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8"/><title>t</title></head><body><main>x</main><script>self.__next_f.push([1,"</body> 문자열"])</script></body></html>'
+        with tempfile.TemporaryDirectory() as d:
+            web = Path(d)
+            (web / "laws").mkdir()
+            for p in (web / "index.html", web / "laws" / "a.html"):
+                p.write_text(html, encoding="utf-8")
+            (web / "data.txt").write_text("</body>", encoding="utf-8")
+            s = g.run(web, quiet=True)
+            self.assertEqual((s["scanned"], s["changed"]), (2, 2))
+            out = (web / "laws" / "a.html").read_text(encoding="utf-8")
+            self.assertIn(g.CSS_TAG + "</head>", out)
+            self.assertTrue(out.endswith(g.JS_TAG + "</body></html>"))
+            self.assertIn('"</body> 문자열"', out)  # 데이터 안의 문자열은 그대로
+            self.assertEqual(out.count("gov-challenge-2026.css"), 1)
+            self.assertEqual(g.run(web, quiet=True)["changed"], 0)  # 다시 실행해도 변경 없음
+            self.assertEqual((web / "data.txt").read_text(encoding="utf-8"), "</body>")  # .html 만 대상
+            g.run(web, revert=True, quiet=True)
+            self.assertEqual((web / "index.html").read_text(encoding="utf-8"), html)
