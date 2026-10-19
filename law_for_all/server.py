@@ -27,9 +27,17 @@ SECURITY_HEADERS = {
     "X-Frame-Options": "SAMEORIGIN",
     "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
 }
+# /api/* 는 단일 파일 공유판(다른 출처·파일로 연 HTML)에서도 부를 수 있게 허용 — 인증키는 서버에만 있고 응답에 담기지 않는다
+CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Max-Age": "600",
+}
 mimetypes.add_type("application/javascript", ".js")
 mimetypes.add_type("text/css", ".css")
 mimetypes.add_type("image/svg+xml", ".svg")
+mimetypes.add_type("font/woff2", ".woff2")
 mimetypes.add_type("text/x-component", ".txt")  # Next.js RSC 페이로드
 
 # ───────────── 간이 요청 제한(고정 창)
@@ -92,7 +100,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        for k, v in {**SECURITY_HEADERS, **(extra or {})}.items():
+        cors = CORS_HEADERS if self.path.startswith("/api/") else {}
+        for k, v in {**SECURITY_HEADERS, **cors, **(extra or {})}.items():
             self.send_header(k, v)
         self.end_headers()
         if not head_only:
@@ -139,6 +148,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         self._route("POST")
+
+    def do_OPTIONS(self):  # 다른 출처의 POST 사전 확인(preflight)
+        self._send(204 if self.path.startswith("/api/") else 404, b"", "text/plain; charset=utf-8")
 
     def _route(self, method: str):
         if method == "POST":
@@ -195,7 +207,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(400, "잘못된 판례 식별자")
             svc = LawService(config.law_access)
             if svc.mode != "live":
-                raise ApiError(503, "판례 보기는 법령 API 중계 서버(LAW_PROXY_URL) 또는 인증키(LAW_API_OC) 설정 시 제공됩니다.")
+                raise ApiError(503, "판례 보기는 법제처 국가법령정보 인증키(LAW_API_OC)를 설정하면 제공됩니다.")
             detail = svc.get_case(kind, case_id)
             if not detail:
                 raise ApiError(404, svc.warnings[0] if svc.warnings else "판례를 찾을 수 없습니다.")
