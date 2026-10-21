@@ -207,6 +207,10 @@ class ServerTest(unittest.TestCase):
         self.assertEqual((s, j["error"]), (400, "질문을 2자 이상 입력해 주세요."))
         s, j, _ = self.req("/api/analyze", {"situation": "짧음"})
         self.assertEqual(s, 400)
+        s, j, _ = self.req("/api/followup", {"question": "언제까지 줘야 하나요?", "prevQuery": "퇴사했는데 마지막 월급을 안 줘요", "mode": "citizen"})
+        self.assertEqual((s, j["intent"], [c["key"] for c in j["citations"]]), (200, "deadline", ["labor-standards:36"]))
+        s, j, _ = self.req("/api/followup", {"question": "기한은?", "prevQuery": ""})
+        self.assertEqual(s, 400)
         s, j, _ = self.req("/api/laws/housing-lease")
         self.assertEqual(j["children"][0]["id"], "housing-lease-decree")
         s, j, _ = self.req("/api/laws/NOPE!")
@@ -226,8 +230,12 @@ class ServerTest(unittest.TestCase):
         conn.close()
         _, _, h = self.req("/api/health")
         self.assertEqual(h["Access-Control-Allow-Origin"], "*")
-        with urllib.request.urlopen(self.base + "/", timeout=5) as res:
-            self.assertIsNone(res.headers.get("Access-Control-Allow-Origin"))
+        try:  # 화면 파일(빌드 전이면 404 페이지)에는 허용 헤더가 없어야 함
+            with urllib.request.urlopen(self.base + "/", timeout=5) as res:
+                headers = res.headers
+        except urllib.error.HTTPError as e:
+            headers = e.headers
+        self.assertIsNone(headers.get("Access-Control-Allow-Origin"))
 
     def test_share_download(self):
         """사이트에서 공유판을 내려받을 때: 열지 않고 저장(attachment), 영문 파일 이름"""
