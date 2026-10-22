@@ -53,6 +53,42 @@ _LAW = data.get_law("housing-lease")
 _CTX = [data.to_citation(_LAW, a) for a in _LAW["articles"] if a["no"] in ("3", "3의2")]
 
 
+class RoutingTest(unittest.TestCase):
+    def test_routing_cases(self):
+        """토픽 라우팅 회귀 시험(Next.js 판과 같은 질문 목록)"""
+        from law_for_all.search import match_topics
+        fx = Path(__file__).resolve().parents[2] / "tests" / "fixtures"
+        if not (fx / "routing-cases.json").is_file():
+            self.skipTest("저장소의 tests/fixtures 가 없음(실행판 단독)")
+        wrong = []
+        for name in ("routing-cases", "routing-holdout"):
+            for c in json.loads((fx / f"{name}.json").read_text(encoding="utf-8"))["cases"]:
+                h = match_topics(c["q"])
+                got = h[0]["topic"]["id"] if h else None
+                if got != c["topic"]:
+                    wrong.append(f"{c['q']} — 기대 {c['topic']} / 실제 {got}")
+        self.assertEqual(wrong, [])
+
+
+class LawAliasTest(unittest.TestCase):
+    def test_alias_cases(self):
+        """생활 용어 → 법령 사전(Next.js 판과 같은 질문 목록), 법령명 낱말 일치"""
+        from law_for_all.search import law_name_has, match_law_aliases
+        fx = Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "alias-cases.json"
+        if fx.is_file():
+            wrong = []
+            for c in json.loads(fx.read_text(encoding="utf-8"))["cases"]:
+                m = match_law_aliases(c["q"])
+                got = m[0]["law"] if m else None
+                if got != c["law"]:
+                    wrong.append(f"{c['q']} — 기대 {c['law']} / 실제 {got}")
+            self.assertEqual(wrong, [])
+        self.assertFalse(law_name_has("군사기밀 보호법", "사기"))
+        self.assertFalse(law_name_has("지진ㆍ화산재해대책법", "산재"))
+        self.assertTrue(law_name_has("주차장법", "주차"))
+        self.assertTrue(law_name_has("소음ㆍ진동관리법", "진동"))
+
+
 class GuardTest(unittest.TestCase):
     ctx = _CTX
 
