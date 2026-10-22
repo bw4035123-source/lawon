@@ -1,0 +1,15 @@
+# 심사 기간 동안 Render 무료 서버가 잠들지 않도록 10분마다 접속(UptimeRobot 대체)
+name: keep-awake
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: lawon.onrender.com 상태 확인
+        run: |
+          code=$(curl -s -m 90 -o /tmp/h.json -w "%{http_code}" https://lawon.onrender.com/api/health || echo 000)
+          echo "HTTP $code"; cat /tmp/h.json 2>/dev/null || true
