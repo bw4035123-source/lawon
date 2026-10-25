@@ -9,6 +9,7 @@ from .data import LAWS, article_key, get_law, parse_key
 from .guard import find_unverified_mentions, guard_llm_output, parse_loose_json, sanitize_markers
 from .llm import resolve_provider
 from .prompts import schema_for, system_prompt, user_prompt
+from .privacy import mask_notice, mask_pii
 from .rule_engine import build_rule_answer
 from .search import match_law_aliases, match_topics, query_terms, search_articles
 from .service import LawService
@@ -38,7 +39,11 @@ def retrieve(query: str, max_n: int = 8):
         for s in topic["citizen"]["steps"]:
             if s.get("ref"):
                 push(s["ref"])
+    # 토픽이 정해졌으면 조문 검색 결과는 그 토픽의 법령(과 하위법령)만 더함 — 글자만 겹친 다른 법(예: 청탁금지 질문에 주택임대차 '상한') 제외
+    topic_laws = {r.split(":")[0] for r in topic["refs"]} if topic else set()
     for h in search_articles(query, 6):
+        if topic and h["law"]["id"] not in topic_laws and (h["law"].get("parentId") or "") not in topic_laws:
+            continue
         push(article_key(h["law"]["id"], h["article"]["no"]))
         for d in h["article"].get("delegates") or []:
             push(article_key(d["lawId"], d["articleNo"]))
@@ -60,7 +65,9 @@ def _mock_article(key: str) -> dict | None:
 
 def ask(query: str, mode: str = "citizen", provider: str | None = None) -> dict:
     started = time.time()
-    notices: list[str] = []
+    # 질문 속 개인정보(주민등록번호·전화번호 등)는 검색·AI로 넘기기 전에 가린다
+    query, masked = mask_pii(query)
+    notices: list[str] = [mask_notice(masked)] if masked else []
     svc = LawService(config.law_access)
     topic, local_keys = retrieve(query)
     # 사람이 검수한 사전이 토픽보다 구체적인 법령을 가리키면(예: '사전통지'→행정절차법) 실시간 검색으로
